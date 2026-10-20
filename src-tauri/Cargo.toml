@@ -1,0 +1,47 @@
+[package]
+name = "jcb-airplay"
+version = "0.1.0"
+description = "JCB AirPlay — ultra-low-latency iPhone AirPlay Screen Mirroring Receiver and zero-reencode DVR clip studio for PC"
+authors = ["JCB"]
+edition = "2021"
+rust-version = "1.77"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant, but it is necessary to make the library
+# target accessible from the integration tests.
+name = "jcb_airplay_lib"
+crate-type = ["lib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri v2 core
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Networking
+socket2 = "0.6"
+if-addrs = "0.15"
+
+[features]
+# This feature is used for production builds or when a dev server is not specified.
+# Docs: https://v2.tauri.app/reference/config/#build-1
+custom-protocol = ["tauri/custom-protocol"]

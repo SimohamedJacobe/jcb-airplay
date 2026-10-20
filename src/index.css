@@ -1,0 +1,27 @@
+/* JCB AirPlay — global styles */
+:root {
+  --color-bg: #0a0a0f;
+  --color-surface: #13131a;
+  --color-primary: #6c63ff;
+  --color-primary-glow: rgba(108, 99, 255, 0.4);
+  --color-text: #e8e8f0;
+  --color-muted: #6b6b7b;
+  --radius: 12px;
+  --font: 'Inter', system-ui, -apple-system, sans-serif;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font);
+  font-size: 16px;
+  -webkit-font-smoothing: antialiased;
+}
