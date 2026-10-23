@@ -41,6 +41,15 @@ anyhow = "1"
 socket2 = "0.6"
 if-addrs = "0.15"
 
+# Cryptography
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes = "0.8"
+ctr = "0.9"
+cbc = "0.1"
+sha2 = "0.10"
+rand = "0.8"
+
 [features]
 # This feature is used for production builds or when a dev server is not specified.
 # Docs: https://v2.tauri.app/reference/config/#build-1
