@@ -1,5 +1,6 @@
 // JCB AirPlay — media.rs
-// H.264 / AAC frame pipeline, lock-free SPSC ring buffer, and AirPlay stream parser.
+// H.264 / AAC frame pipeline, lock-free SPSC ring buffer, AirPlay stream parser,
+// continuous AES-128-CTR stream processor, and Annex-B NAL assembler.
 //
 // Responsibilities:
 //   • Zero-copy parsing and serialization for the 128-byte AirPlay mirroring stream header.
@@ -7,8 +8,13 @@
 //     for moving media packets across network reader and decoder threads with zero heap
 //     reallocations and atomic telemetry.
 //   • Asynchronous mirroring stream TCP reader (port 7100).
+//   • Continuous AES-128-CTR stream processor maintaining keystream continuity across packets.
+//   • ISO/IEC 14496-15 AVCDecoderConfigurationRecord parser for SPS/PPS extraction.
+//   • AVCC 4-byte length-prefixed to H.264 Annex-B NAL unit reconstructor.
 //   • Demux incoming RTP payloads into H.264 NAL units and AAC ADTS frames.
 
+use crate::crypto::StreamKey;
+use ctr::cipher::{KeyIvInit, StreamCipher};
 use std::cell::UnsafeCell;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -16,6 +22,9 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
+
+/// AES-128 in Counter Mode with 128-bit big-endian counter (mirrors crypto::Aes128Ctr).
+type Aes128Ctr = ctr::Ctr128BE<aes::Aes128>;
 
 /// The exact length of an AirPlay mirroring stream packet header in bytes.
 pub const AIRPLAY_STREAM_HEADER_LEN: usize = 128;
@@ -26,6 +35,9 @@ pub const MAX_PAYLOAD_SIZE: u32 = 8 * 1024 * 1024;
 
 /// Default TCP port for the AirPlay mirroring stream.
 pub const DEFAULT_MIRRORING_PORT: u16 = 7100;
+
+/// H.264 Annex-B byte-stream start code: `0x00 0x00 0x00 0x01`.
+pub const ANNEXB_START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
 /// Errors that can occur in the media pipeline or stream parser.
 #[derive(Debug, Error)]
@@ -53,6 +65,14 @@ pub enum MediaError {
     /// I/O error occurred during stream reading.
     #[error("stream I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// AVCDecoderConfigurationRecord is malformed or cannot be parsed.
+    #[error("malformed AVCDecoderConfigurationRecord: {0}")]
+    AvccMalformed(String),
+
+    /// Cipher not initialised: stream key must be set before decrypting video bitstream.
+    #[error("stream cipher not initialised — set a StreamKey before processing video bitstream")]
+    CipherNotInitialised,
 }
 
 /// RTP payload types used by AirPlay audio/video baseline.
@@ -756,6 +776,369 @@ pub fn parse_rtp_frame(pt: u8, timestamp: u32, payload: &[u8]) -> Result<MediaFr
     ))
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 6: Continuous AES-128-CTR Stream Processor & H.264 Annex-B NAL Assembler
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// H.264 NAL unit types extracted from the `nal_unit_type` field (`byte & 0x1F`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NalUnitType {
+    /// Non-IDR coded slice (type 1).
+    NonIdrSlice,
+    /// IDR (keyframe) coded slice (type 5).
+    IdrSlice,
+    /// Supplemental Enhancement Information (SEI) message (type 6).
+    Sei,
+    /// Sequence Parameter Set (SPS) (type 7).
+    Sps,
+    /// Picture Parameter Set (PPS) (type 8).
+    Pps,
+    /// Vendor-specific or reserved NAL unit type.
+    Other(u8),
+}
+
+impl NalUnitType {
+    /// Parse a NAL unit type from the first byte of a NAL unit (`byte & 0x1F`).
+    #[must_use]
+    pub fn from_nal_byte(nal_byte: u8) -> Self {
+        match nal_byte & 0x1F {
+            1 => Self::NonIdrSlice,
+            5 => Self::IdrSlice,
+            6 => Self::Sei,
+            7 => Self::Sps,
+            8 => Self::Pps,
+            other => Self::Other(other),
+        }
+    }
+
+    /// Returns `true` if this is an IDR (keyframe) slice.
+    #[must_use]
+    pub fn is_keyframe(&self) -> bool {
+        matches!(self, Self::IdrSlice)
+    }
+
+    /// Returns the raw NAL unit type value.
+    #[must_use]
+    pub fn as_u8(&self) -> u8 {
+        match *self {
+            Self::NonIdrSlice => 1,
+            Self::IdrSlice => 5,
+            Self::Sei => 6,
+            Self::Sps => 7,
+            Self::Pps => 8,
+            Self::Other(v) => v,
+        }
+    }
+}
+
+/// A classified NAL unit and its position within the Annex-B output buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NalUnit {
+    /// Classified NAL unit type.
+    pub nal_type: NalUnitType,
+    /// Byte offset of the Annex-B start code (`0x00 0x00 0x00 0x01`) in the output buffer.
+    pub offset: usize,
+    /// Length of the NAL unit data (not including the 4-byte start code).
+    pub length: usize,
+}
+
+/// Fully assembled H.264 Annex-B frame with NAL unit metadata.
+#[derive(Debug, Clone)]
+pub struct AnnexBFrame {
+    /// H.264 Annex-B byte stream (start codes + NAL unit bytes). For IDR frames,
+    /// cached SPS and PPS are prepended immediately before the first IDR NAL unit.
+    pub data: Vec<u8>,
+    /// Metadata for each NAL unit found in this frame, in order of appearance.
+    pub nal_units: Vec<NalUnit>,
+    /// `true` if at least one IDR NAL unit was found in this frame.
+    pub is_keyframe: bool,
+}
+
+/// Stateful continuous AES-128-CTR stream cipher processor.
+///
+/// Unlike packet-level counter reset, this processor maintains keystream continuity
+/// across successive calls to [`apply`](Self::apply). The internal 128-bit CTR is
+/// advanced by the number of bytes processed in each call and is **never** reset
+/// between packets.
+pub struct CtrStreamProcessor {
+    cipher: Aes128Ctr,
+    bytes_processed: u64,
+}
+
+impl CtrStreamProcessor {
+    /// Initialise the continuous AES-128-CTR cipher from a [`StreamKey`].
+    ///
+    /// The base IV from the key is used directly (no per-packet XOR mixing).
+    #[must_use]
+    pub fn new(stream_key: &StreamKey) -> Self {
+        let cipher = Aes128Ctr::new((&stream_key.key).into(), (&stream_key.iv).into());
+        Self {
+            cipher,
+            bytes_processed: 0,
+        }
+    }
+
+    /// Apply keystream in-place, advancing the continuous cipher state.
+    ///
+    /// Successive calls are equivalent to a single call over the concatenation of all buffers.
+    pub fn apply(&mut self, buf: &mut [u8]) {
+        self.cipher.apply_keystream(buf);
+        self.bytes_processed += buf.len() as u64;
+    }
+
+    /// Total bytes processed since cipher initialisation.
+    #[must_use]
+    pub fn bytes_processed(&self) -> u64 {
+        self.bytes_processed
+    }
+}
+
+/// H.264 Annex-B NAL unit assembler.
+///
+/// Combines:
+/// 1. Continuous AES-128-CTR decryption of incoming video bitstream payloads.
+/// 2. ISO/IEC 14496-15 `AVCDecoderConfigurationRecord` parsing for SPS/PPS extraction.
+/// 3. AVCC 4-byte big-endian length-prefix → Annex-B start code conversion.
+/// 4. Automatic SPS/PPS prepending for IDR keyframe slices.
+pub struct H264AnnexBAssembler {
+    stream_cipher: Option<CtrStreamProcessor>,
+    cached_sps_annexb: Vec<u8>,
+    cached_pps_annexb: Vec<u8>,
+}
+
+impl Default for H264AnnexBAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl H264AnnexBAssembler {
+    /// Create a new assembler with no stream cipher and no cached SPS/PPS.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            stream_cipher: None,
+            cached_sps_annexb: Vec::new(),
+            cached_pps_annexb: Vec::new(),
+        }
+    }
+
+    /// Attach a [`StreamKey`] to enable continuous AES-128-CTR decryption of video packets.
+    #[must_use]
+    pub fn with_stream_key(mut self, key: &StreamKey) -> Self {
+        self.stream_cipher = Some(CtrStreamProcessor::new(key));
+        self
+    }
+
+    /// Attach a pre-built [`CtrStreamProcessor`] (for testing or hot-swap).
+    pub fn set_stream_cipher(&mut self, proc: CtrStreamProcessor) {
+        self.stream_cipher = Some(proc);
+    }
+
+    /// Parse a `CodecConfig` (`0x01`) payload as an `AVCDecoderConfigurationRecord`
+    /// (ISO/IEC 14496-15) and cache SPS and PPS NAL units in Annex-B format.
+    ///
+    /// # Errors
+    /// Returns [`MediaError::AvccMalformed`] if the record is too short, has an
+    /// unexpected configuration version, or contains no SPS entries.
+    pub fn process_codec_config(&mut self, payload: &[u8]) -> Result<(), MediaError> {
+        if payload.len() < 6 {
+            return Err(MediaError::AvccMalformed(format!(
+                "too short: {} bytes (minimum 6)",
+                payload.len()
+            )));
+        }
+
+        if payload[0] != 0x01 {
+            return Err(MediaError::AvccMalformed(format!(
+                "unsupported configurationVersion: {:#04x} (expected 0x01)",
+                payload[0]
+            )));
+        }
+
+        let length_size = usize::from(payload[4] & 0x03) + 1;
+        if length_size != 4 {
+            return Err(MediaError::AvccMalformed(format!(
+                "unsupported NAL length size: {length_size} (expected 4)"
+            )));
+        }
+
+        let num_sps = usize::from(payload[5] & 0x1F);
+        if num_sps == 0 {
+            return Err(MediaError::AvccMalformed(
+                "AVCDecoderConfigurationRecord contains no SPS".to_string(),
+            ));
+        }
+
+        let mut cursor = 6usize;
+        self.cached_sps_annexb.clear();
+
+        for _ in 0..num_sps {
+            if cursor + 2 > payload.len() {
+                return Err(MediaError::AvccMalformed(
+                    "truncated SPS length field".to_string(),
+                ));
+            }
+            let sps_len = u16::from_be_bytes(
+                payload[cursor..cursor + 2]
+                    .try_into()
+                    .map_err(|_| MediaError::MalformedFrame)?,
+            ) as usize;
+            cursor += 2;
+            if cursor + sps_len > payload.len() {
+                return Err(MediaError::AvccMalformed(
+                    "truncated SPS NAL data".to_string(),
+                ));
+            }
+            self.cached_sps_annexb.extend_from_slice(&ANNEXB_START_CODE);
+            self.cached_sps_annexb
+                .extend_from_slice(&payload[cursor..cursor + sps_len]);
+            cursor += sps_len;
+        }
+
+        if cursor >= payload.len() {
+            return Err(MediaError::AvccMalformed(
+                "missing numPPS field".to_string(),
+            ));
+        }
+        let num_pps = usize::from(payload[cursor]);
+        cursor += 1;
+
+        self.cached_pps_annexb.clear();
+
+        for _ in 0..num_pps {
+            if cursor + 2 > payload.len() {
+                return Err(MediaError::AvccMalformed(
+                    "truncated PPS length field".to_string(),
+                ));
+            }
+            let pps_len = u16::from_be_bytes(
+                payload[cursor..cursor + 2]
+                    .try_into()
+                    .map_err(|_| MediaError::MalformedFrame)?,
+            ) as usize;
+            cursor += 2;
+            if cursor + pps_len > payload.len() {
+                return Err(MediaError::AvccMalformed(
+                    "truncated PPS NAL data".to_string(),
+                ));
+            }
+            self.cached_pps_annexb.extend_from_slice(&ANNEXB_START_CODE);
+            self.cached_pps_annexb
+                .extend_from_slice(&payload[cursor..cursor + pps_len]);
+            cursor += pps_len;
+        }
+
+        log::debug!(
+            "media: cached SPS ({} bytes) + PPS ({} bytes) in Annex-B format",
+            self.cached_sps_annexb.len(),
+            self.cached_pps_annexb.len()
+        );
+
+        Ok(())
+    }
+
+    /// Process a `VideoBitstream` (`0x00`) payload:
+    ///
+    /// 1. Applies the continuous AES-128-CTR keystream **in-place** on `payload`.
+    /// 2. Iterates AVCC 4-byte big-endian length-prefixed NAL units.
+    /// 3. Converts each to Annex-B start code format in the output buffer.
+    /// 4. Classifies each NAL unit type and records its offset.
+    /// 5. Prepends cached SPS + PPS in Annex-B format immediately before the first IDR NAL.
+    ///
+    /// Truncated or zero-length NAL units are logged and skipped without panicking.
+    ///
+    /// # Errors
+    /// Returns [`MediaError::MalformedFrame`] if byte slicing fails unexpectedly.
+    pub fn process_video_bitstream(
+        &mut self,
+        payload: &mut Vec<u8>,
+    ) -> Result<AnnexBFrame, MediaError> {
+        // Step 1: apply continuous CTR decryption in-place.
+        if let Some(ref mut proc) = self.stream_cipher {
+            proc.apply(payload.as_mut_slice());
+        }
+
+        // Step 2: build Annex-B output from AVCC NAL units.
+        let param_overhead = self.cached_sps_annexb.len() + self.cached_pps_annexb.len();
+        let mut out: Vec<u8> = Vec::with_capacity(payload.len() + param_overhead + 16);
+        let mut nal_units: Vec<NalUnit> = Vec::new();
+        let mut is_keyframe = false;
+        let mut idr_params_prepended = false;
+        let mut offset = 0usize;
+
+        while offset + 4 <= payload.len() {
+            let len_bytes: [u8; 4] = payload[offset..offset + 4]
+                .try_into()
+                .map_err(|_| MediaError::MalformedFrame)?;
+            let nal_len = u32::from_be_bytes(len_bytes) as usize;
+
+            // Bounds check: skip truncated or empty NAL units without panicking.
+            if nal_len == 0 || offset + 4 + nal_len > payload.len() {
+                log::warn!(
+                    "media: truncated or empty AVCC NAL unit at offset {} \
+                     (claimed {} bytes, {} available)",
+                    offset,
+                    nal_len,
+                    payload.len().saturating_sub(offset + 4)
+                );
+                break;
+            }
+
+            let nal_first_byte = payload[offset + 4];
+            let nal_type = NalUnitType::from_nal_byte(nal_first_byte);
+
+            // Before writing the first IDR NAL, prepend cached SPS + PPS.
+            if nal_type == NalUnitType::IdrSlice && !idr_params_prepended {
+                is_keyframe = true;
+                idr_params_prepended = true;
+                if !self.cached_sps_annexb.is_empty() {
+                    out.extend_from_slice(&self.cached_sps_annexb);
+                }
+                if !self.cached_pps_annexb.is_empty() {
+                    out.extend_from_slice(&self.cached_pps_annexb);
+                }
+            }
+
+            let nal_start_in_out = out.len();
+            out.extend_from_slice(&ANNEXB_START_CODE);
+            out.extend_from_slice(&payload[offset + 4..offset + 4 + nal_len]);
+
+            nal_units.push(NalUnit {
+                nal_type,
+                offset: nal_start_in_out,
+                length: nal_len,
+            });
+
+            offset += 4 + nal_len;
+        }
+
+        Ok(AnnexBFrame {
+            data: out,
+            nal_units,
+            is_keyframe,
+        })
+    }
+
+    /// Returns the cached SPS NAL unit(s) in Annex-B format (with start code prefix).
+    #[must_use]
+    pub fn cached_sps(&self) -> &[u8] {
+        &self.cached_sps_annexb
+    }
+
+    /// Returns the cached PPS NAL unit(s) in Annex-B format (with start code prefix).
+    #[must_use]
+    pub fn cached_pps(&self) -> &[u8] {
+        &self.cached_pps_annexb
+    }
+
+    /// Returns `true` if both SPS and PPS have been successfully cached.
+    #[must_use]
+    pub fn has_codec_config(&self) -> bool {
+        !self.cached_sps_annexb.is_empty() && !self.cached_pps_annexb.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -879,5 +1262,157 @@ mod tests {
 
         let telem = ring.telemetry();
         assert_eq!(telem.packets_popped, 2);
+    }
+
+    // ── Step 6 unit tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn nal_unit_type_classification() {
+        assert_eq!(NalUnitType::from_nal_byte(0x61), NalUnitType::NonIdrSlice); // 0x61 & 0x1F = 1
+        assert_eq!(NalUnitType::from_nal_byte(0x65), NalUnitType::IdrSlice); // 0x65 & 0x1F = 5
+        assert_eq!(NalUnitType::from_nal_byte(0x06), NalUnitType::Sei);
+        assert_eq!(NalUnitType::from_nal_byte(0x27), NalUnitType::Sps); // 0x27 & 0x1F = 7
+        assert_eq!(NalUnitType::from_nal_byte(0x28), NalUnitType::Pps); // 0x28 & 0x1F = 8
+        assert_eq!(NalUnitType::from_nal_byte(0x00), NalUnitType::Other(0));
+        assert!(!NalUnitType::NonIdrSlice.is_keyframe());
+        assert!(NalUnitType::IdrSlice.is_keyframe());
+        assert_eq!(NalUnitType::IdrSlice.as_u8(), 5);
+    }
+
+    #[test]
+    fn codec_config_parse_rejects_short_payload() {
+        let mut asm = H264AnnexBAssembler::new();
+        assert!(matches!(
+            asm.process_codec_config(&[0u8; 5]),
+            Err(MediaError::AvccMalformed(_))
+        ));
+    }
+
+    #[test]
+    fn codec_config_parse_sps_pps_correct() {
+        let sps_data: &[u8] = &[0x67, 0x42, 0x00, 0x1F, 0xD0, 0x0A, 0x09];
+        let pps_data: &[u8] = &[0x68, 0xCE, 0x38, 0x80];
+        let mut record = vec![
+            0x01u8, // configurationVersion
+            0x42,   // AVCProfileIndication (Baseline)
+            0x00,   // profile_compatibility
+            0x1F,   // AVCLevelIndication (3.1)
+            0xFF,   // lengthSizeMinusOne = 3 (4-byte AVCC lengths)
+            0xE1,   // numSPS = 1
+        ];
+        record.extend(&(sps_data.len() as u16).to_be_bytes());
+        record.extend_from_slice(sps_data);
+        record.push(0x01); // numPPS
+        record.extend(&(pps_data.len() as u16).to_be_bytes());
+        record.extend_from_slice(pps_data);
+
+        let mut asm = H264AnnexBAssembler::new();
+        asm.process_codec_config(&record).expect("codec config parse");
+        assert!(asm.has_codec_config());
+
+        let expected_sps: Vec<u8> = [&ANNEXB_START_CODE[..], sps_data].concat();
+        assert_eq!(asm.cached_sps(), expected_sps.as_slice());
+
+        let expected_pps: Vec<u8> = [&ANNEXB_START_CODE[..], pps_data].concat();
+        assert_eq!(asm.cached_pps(), expected_pps.as_slice());
+    }
+
+    #[test]
+    fn avcc_to_annexb_non_idr_single_nal() {
+        let nal_data: &[u8] = &[0x61, 0xAB, 0xCD, 0xEF, 0x01];
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend(&(nal_data.len() as u32).to_be_bytes());
+        payload.extend_from_slice(nal_data);
+
+        let mut asm = H264AnnexBAssembler::new();
+        let frame = asm.process_video_bitstream(&mut payload).unwrap();
+
+        assert!(!frame.is_keyframe);
+        assert_eq!(frame.nal_units.len(), 1);
+        assert_eq!(frame.nal_units[0].nal_type, NalUnitType::NonIdrSlice);
+        assert_eq!(frame.nal_units[0].length, nal_data.len());
+
+        let expected: Vec<u8> = [&ANNEXB_START_CODE[..], nal_data].concat();
+        assert_eq!(frame.data, expected);
+    }
+
+    #[test]
+    fn avcc_to_annexb_idr_prepends_sps_pps() {
+        let sps_data: &[u8] = &[0x67, 0x42, 0x00, 0x1F, 0xD0, 0x0A, 0x09];
+        let pps_data: &[u8] = &[0x68, 0xCE, 0x38, 0x80];
+        let idr_nal: &[u8] = &[0x65, 0x88, 0x84, 0x00, 0x33];
+
+        let mut record = vec![0x01u8, 0x42, 0x00, 0x1F, 0xFF, 0xE1];
+        record.extend(&(sps_data.len() as u16).to_be_bytes());
+        record.extend_from_slice(sps_data);
+        record.push(0x01);
+        record.extend(&(pps_data.len() as u16).to_be_bytes());
+        record.extend_from_slice(pps_data);
+
+        let mut asm = H264AnnexBAssembler::new();
+        asm.process_codec_config(&record).unwrap();
+
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend(&(idr_nal.len() as u32).to_be_bytes());
+        payload.extend_from_slice(idr_nal);
+
+        let frame = asm.process_video_bitstream(&mut payload).unwrap();
+
+        assert!(frame.is_keyframe);
+        assert_eq!(frame.nal_units.len(), 1);
+        assert_eq!(frame.nal_units[0].nal_type, NalUnitType::IdrSlice);
+
+        let mut expected: Vec<u8> = Vec::new();
+        expected.extend(&ANNEXB_START_CODE);
+        expected.extend_from_slice(sps_data);
+        expected.extend(&ANNEXB_START_CODE);
+        expected.extend_from_slice(pps_data);
+        expected.extend(&ANNEXB_START_CODE);
+        expected.extend_from_slice(idr_nal);
+        assert_eq!(frame.data, expected);
+    }
+
+    #[test]
+    fn avcc_truncated_nal_does_not_panic() {
+        // Payload claims 100-byte NAL but only 4 bytes follow — must NOT panic.
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend(&100u32.to_be_bytes());
+        payload.extend(&[0x61u8, 0x00, 0x00, 0x00]);
+        let mut asm = H264AnnexBAssembler::new();
+        let frame = asm.process_video_bitstream(&mut payload).unwrap();
+        assert!(frame.nal_units.is_empty());
+    }
+
+    #[test]
+    fn ctr_stream_processor_keystream_continuity() {
+        use crate::crypto::StreamKey;
+        let key = StreamKey::from_bytes(&[0x42u8; 16], &[0xABu8; 16]).unwrap();
+
+        // Reference: encrypt full plaintext in one shot.
+        let plaintext: Vec<u8> = (0u8..=127).collect();
+        let mut ref_proc = CtrStreamProcessor::new(&key);
+        let mut ref_buf = plaintext.clone();
+        ref_proc.apply(&mut ref_buf);
+        let reference_ciphertext = ref_buf;
+
+        // Test: same key/IV applied across three sequential chunks.
+        let mut proc = CtrStreamProcessor::new(&key);
+        let mut chunk1 = plaintext[0..48].to_vec();
+        let mut chunk2 = plaintext[48..96].to_vec();
+        let mut chunk3 = plaintext[96..128].to_vec();
+        proc.apply(&mut chunk1);
+        proc.apply(&mut chunk2);
+        proc.apply(&mut chunk3);
+
+        let mut reassembled = chunk1;
+        reassembled.extend(chunk2);
+        reassembled.extend(chunk3);
+
+        assert_eq!(
+            reassembled,
+            reference_ciphertext,
+            "CTR keystream continuity broken across chunk boundaries"
+        );
+        assert_eq!(proc.bytes_processed(), 128);
     }
 }
