@@ -1,66 +1,406 @@
-/* App component styles */
-.app {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  min-height: 100vh;
-  gap: 1.5rem;
-  padding: 2rem;
+/* ─── JCB AirPlay Studio UI Aesthetics ────────────────────────────────────── */
+
+:root {
+  --color-bg: #09090f;
+  --color-surface: #12131c;
+  --color-surface-hover: #191b26;
+  --color-surface-glass: rgba(18, 19, 28, 0.75);
+  --color-border: rgba(255, 255, 255, 0.08);
+  --color-border-glow: rgba(108, 99, 255, 0.25);
+  --color-primary: #6c63ff;
+  --color-primary-bright: #837bff;
+  --color-primary-glow: rgba(108, 99, 255, 0.4);
+  --color-accent: #00e5ff;
+  --color-success: #10b981;
+  --color-warning: #f59e0b;
+  --color-danger: #ef4444;
+  --color-text: #f0f1f8;
+  --color-text-muted: #8b8ea4;
+  --radius-lg: 16px;
+  --radius-md: 10px;
+  --radius-sm: 6px;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
 }
 
-.app h1 {
-  font-size: 2.5rem;
+.studio-app {
+  display: flex;
+  flex-direction: column;
+  min-height: 100vh;
+  width: 100%;
+  background: radial-gradient(circle at 50% 0%, #151628 0%, #08090e 70%);
+  color: var(--color-text);
+  overflow-x: hidden;
+}
+
+/* ─── Studio Header ────────────────────────────────────────────────────────── */
+
+.studio-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 1rem 2rem;
+  background: rgba(10, 10, 16, 0.6);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--color-border);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.header-brand {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.brand-logo-glow {
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  background: linear-gradient(135deg, var(--color-primary), var(--color-accent));
+  box-shadow: 0 0 20px var(--color-primary-glow);
+  position: relative;
+}
+
+.brand-logo-glow::after {
+  content: '▲';
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 16px;
+  color: #fff;
+}
+
+.brand-titles {
+  display: flex;
+  flex-direction: column;
+}
+
+.brand-title {
+  font-size: 1.4rem;
   font-weight: 700;
-  background: linear-gradient(135deg, #6c63ff, #a78bfa);
+  letter-spacing: -0.02em;
+  background: linear-gradient(135deg, #ffffff 40%, #a78bfa);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
 }
 
-.subtitle {
-  color: var(--color-muted);
-  font-size: 1rem;
+.brand-tagline {
+  font-size: 0.75rem;
+  color: var(--color-text-muted);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 500;
 }
 
-.ipc-demo {
+.header-badges {
   display: flex;
+  align-items: center;
   gap: 0.75rem;
 }
 
-.ipc-demo input {
-  padding: 0.5rem 1rem;
-  border-radius: var(--radius);
-  border: 1px solid #2a2a3a;
+.status-pill {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.85rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  border: 1px solid var(--color-border);
+  background: var(--color-surface-glass);
+}
+
+.status-pill.live {
+  color: var(--color-success);
+  border-color: rgba(16, 185, 129, 0.3);
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.15);
+}
+
+.status-pill.standby {
+  color: var(--color-text-muted);
+}
+
+.pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.status-pill.live .pulse-dot {
+  animation: pulse 1.8s infinite;
+}
+
+@keyframes pulse {
+  0% { transform: scale(0.9); opacity: 0.7; }
+  50% { transform: scale(1.4); opacity: 1; }
+  100% { transform: scale(0.9); opacity: 0.7; }
+}
+
+.protocol-pill {
+  padding: 0.35rem 0.75rem;
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  color: var(--color-accent);
+  background: rgba(0, 229, 255, 0.08);
+  border: 1px solid rgba(0, 229, 255, 0.2);
+}
+
+/* ─── Main Viewport & Stage ────────────────────────────────────────────────── */
+
+.studio-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 1.5rem 2rem 2rem;
+  gap: 1.5rem;
+  max-width: 1400px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+.viewport-stage {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 520px;
+}
+
+.viewport-frame {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  width: 100%;
+  height: 100%;
+}
+
+/* ─── Mirror Canvas & Aspect Ratio Adaptations ────────────────────────────── */
+
+.mirror-canvas-wrapper {
+  position: relative;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  background: #000;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6), 0 0 0 1px var(--color-border);
+  transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.mirror-canvas-wrapper.portrait-mode {
+  border: 2px solid rgba(255, 255, 255, 0.12);
+  border-radius: 36px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8), 0 0 30px rgba(108, 99, 255, 0.15);
+}
+
+.mirror-canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+
+/* ─── Canvas HUD Overlay ───────────────────────────────────────────────────── */
+
+.mirror-hud-overlay {
+  position: absolute;
+  top: 12px;
+  left: 12px;
+  right: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+  z-index: 10;
+}
+
+.hud-badge {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  background: rgba(10, 10, 15, 0.75);
+  backdrop-filter: blur(8px);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--color-text);
+}
+
+.hud-sub {
+  color: var(--color-text-muted);
+  font-weight: 400;
+}
+
+.status-indicator {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+}
+
+.status-indicator.active {
+  background: var(--color-success);
+  box-shadow: 0 0 8px var(--color-success);
+}
+
+.status-indicator.idle {
+  background: var(--color-warning);
+}
+
+.hud-fps {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  color: var(--color-accent);
+}
+
+.fps-number {
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+/* ─── Control Deck ─────────────────────────────────────────────────────────── */
+
+.control-deck {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1rem;
+  width: 100%;
+}
+
+.controls-group {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.studio-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.65rem 1.25rem;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--color-border);
   background: var(--color-surface);
   color: var(--color-text);
-  font-size: 0.95rem;
-  outline: none;
-  min-width: 200px;
-}
-
-.ipc-demo input:focus {
-  border-color: var(--color-primary);
-  box-shadow: 0 0 0 3px var(--color-primary-glow);
-}
-
-.ipc-demo button {
-  padding: 0.5rem 1.25rem;
-  border-radius: var(--radius);
-  border: none;
-  background: var(--color-primary);
-  color: #fff;
-  font-size: 0.95rem;
+  font-size: 0.88rem;
   font-weight: 600;
   cursor: pointer;
-  transition: opacity 0.2s;
+  transition: all 0.2s ease;
+  user-select: none;
 }
 
-.ipc-demo button:hover {
-  opacity: 0.85;
+.studio-btn:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+  border-color: rgba(255, 255, 255, 0.2);
+  transform: translateY(-1px);
 }
 
-#greet-msg {
-  color: var(--color-primary);
-  font-size: 0.95rem;
+.studio-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.studio-btn.active-btn {
+  background: var(--color-primary);
+  border-color: var(--color-primary-bright);
+  color: #fff;
+  box-shadow: 0 0 20px var(--color-primary-glow);
+}
+
+.studio-btn.danger-btn:hover:not(:disabled) {
+  background: rgba(239, 68, 68, 0.2);
+  border-color: var(--color-danger);
+  color: #fca5a5;
+}
+
+.studio-btn.ghost-btn {
+  background: transparent;
+}
+
+.studio-btn.btn-toggled {
+  border-color: var(--color-accent);
+  color: var(--color-accent);
+}
+
+.studio-btn.subtle-btn {
+  background: transparent;
+  border-color: transparent;
+  color: var(--color-text-muted);
+  font-size: 0.8rem;
+  padding: 0.4rem 0.8rem;
+}
+
+.studio-btn.subtle-btn:hover {
+  color: var(--color-text);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.btn-icon {
+  font-size: 1rem;
+}
+
+.ipc-feedback {
+  font-size: 0.8rem;
+  color: var(--color-accent);
+  font-family: var(--font-mono);
+}
+
+/* ─── Telemetry Dashboard ──────────────────────────────────────────────────── */
+
+.telemetry-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 1rem;
+  width: 100%;
+}
+
+.telemetry-card {
+  display: flex;
+  flex-direction: column;
+  padding: 1rem 1.25rem;
+  background: var(--color-surface-glass);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  backdrop-filter: blur(8px);
+}
+
+.card-label {
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--color-text-muted);
+  font-weight: 600;
+  margin-bottom: 0.35rem;
+}
+
+.card-value {
+  font-size: 1.1rem;
+  font-weight: 700;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.card-value.highlight-accent {
+  color: var(--color-accent);
+}
+
+.card-sub {
+  font-size: 0.75rem;
+  font-weight: 400;
+  color: var(--color-text-muted);
 }

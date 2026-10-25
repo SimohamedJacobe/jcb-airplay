@@ -17,8 +17,8 @@ use crate::crypto::StreamKey;
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use std::cell::UnsafeCell;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -1319,7 +1319,97 @@ impl DecodedFrame {
             && self.y_stride >= self.width
             && self.uv_stride >= self.width / 2
     }
+
+    /// Serialize frame into a contiguous packed binary buffer:
+    /// 28-byte header (`magic`, `width`, `height`, `timestamp_ntp`, `y_stride`, `uv_stride`)
+    /// followed by raw planar `Y`, `U`, and `V` bytes.
+    #[must_use]
+    pub fn to_packed_bytes(&self) -> Vec<u8> {
+        let total_size = PACKED_FRAME_HEADER_LEN
+            + self.y_plane.len()
+            + self.u_plane.len()
+            + self.v_plane.len();
+        let mut buf = Vec::with_capacity(total_size);
+        buf.extend_from_slice(&PACKED_FRAME_MAGIC);
+        buf.extend_from_slice(&self.width.to_le_bytes());
+        buf.extend_from_slice(&self.height.to_le_bytes());
+        buf.extend_from_slice(&self.timestamp_ntp.to_le_bytes());
+        buf.extend_from_slice(&self.y_stride.to_le_bytes());
+        buf.extend_from_slice(&self.uv_stride.to_le_bytes());
+        buf.extend_from_slice(&self.y_plane);
+        buf.extend_from_slice(&self.u_plane);
+        buf.extend_from_slice(&self.v_plane);
+        buf
+    }
+
+    /// Parse a packed binary frame buffer into a [`DecodedFrame`].
+    ///
+    /// # Errors
+    /// Returns [`MediaError::MalformedFrame`] if magic does not match or buffer length is truncated.
+    pub fn from_packed_bytes(bytes: &[u8]) -> Result<Self, MediaError> {
+        if bytes.len() < PACKED_FRAME_HEADER_LEN || bytes[0..4] != PACKED_FRAME_MAGIC {
+            return Err(MediaError::MalformedFrame);
+        }
+        let width = u32::from_le_bytes(
+            bytes[4..8]
+                .try_into()
+                .map_err(|_| MediaError::MalformedFrame)?,
+        );
+        let height = u32::from_le_bytes(
+            bytes[8..12]
+                .try_into()
+                .map_err(|_| MediaError::MalformedFrame)?,
+        );
+        let timestamp_ntp = u64::from_le_bytes(
+            bytes[12..20]
+                .try_into()
+                .map_err(|_| MediaError::MalformedFrame)?,
+        );
+        let y_stride = u32::from_le_bytes(
+            bytes[20..24]
+                .try_into()
+                .map_err(|_| MediaError::MalformedFrame)?,
+        );
+        let uv_stride = u32::from_le_bytes(
+            bytes[24..28]
+                .try_into()
+                .map_err(|_| MediaError::MalformedFrame)?,
+        );
+
+        let y_len = (width * height) as usize;
+        let uv_len = ((width / 2) * (height / 2)) as usize;
+        let expected_total = PACKED_FRAME_HEADER_LEN + y_len + uv_len * 2;
+        if bytes.len() < expected_total {
+            return Err(MediaError::MalformedFrame);
+        }
+
+        let mut offset = PACKED_FRAME_HEADER_LEN;
+        let y_plane = bytes[offset..offset + y_len].to_vec();
+        offset += y_len;
+        let u_plane = bytes[offset..offset + uv_len].to_vec();
+        offset += uv_len;
+        let v_plane = bytes[offset..offset + uv_len].to_vec();
+
+        Ok(Self {
+            y_plane,
+            u_plane,
+            v_plane,
+            width,
+            height,
+            y_stride,
+            uv_stride,
+            timestamp_ntp,
+            decode_duration_us: 0,
+        })
+    }
 }
+
+/// Magic byte identifier for packed JCB video frames: "JCBF" (0x4A, 0x43, 0x42, 0x46).
+pub const PACKED_FRAME_MAGIC: [u8; 4] = *b"JCBF";
+
+/// Exact byte length of the packed video frame header.
+pub const PACKED_FRAME_HEADER_LEN: usize = 28;
+
 
 /// Bit reader for parsing ITU-T H.264 RBSP bitstreams and Exp-Golomb coded integers.
 struct BitReader<'a> {
@@ -2050,6 +2140,206 @@ impl<D: H264DecoderEngine> JitterGatekeeper<D> {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Step 8: Zero-CPU-Conversion WebGL2 YUV420p GPU Shader & Binary Frame Pipe
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Standard ITU-R BT.709 color specification in 8-bit YUV values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmpteColor {
+    /// Luma (Y) value: 16 (black) to 235 (nominal peak white).
+    pub y: u8,
+    /// Chroma blue (U/Cb) value: 16 to 240, centered at 128.
+    pub u: u8,
+    /// Chroma red (V/Cr) value: 16 to 240, centered at 128.
+    pub v: u8,
+}
+
+/// The eight canonical 75% ITU-R BT.709 SMPTE color bars.
+pub const SMPTE_BT709_COLORS: [SmpteColor; 8] = [
+    SmpteColor { y: 180, u: 128, v: 128 }, // 75% White
+    SmpteColor { y: 168, u: 44,  v: 136 }, // Yellow
+    SmpteColor { y: 145, u: 147, v: 44  }, // Cyan
+    SmpteColor { y: 133, u: 63,  v: 52  }, // Green
+    SmpteColor { y: 63,  u: 193, v: 204 }, // Magenta
+    SmpteColor { y: 51,  u: 109, v: 212 }, // Red
+    SmpteColor { y: 28,  u: 212, v: 120 }, // Blue
+    SmpteColor { y: 16,  u: 128, v: 128 }, // Black
+];
+
+/// Generate a synthetic 60fps SMPTE YUV420p test frame with moving radar indicator.
+///
+/// Features:
+/// - Exact ITU-R BT.709 color-bar calibration across top 75% split.
+/// - Alignment/pluge reference block split across bottom 25%.
+/// - Moving horizontal scan cursor (`(frame_index * 8) % width`) and rotating radar sweep
+///   to visually prove live 60fps continuous GPU canvas rendering without an iPhone connected.
+#[must_use]
+pub fn generate_smpte_frame(width: u32, height: u32, frame_index: u64) -> DecodedFrame {
+    let w = (width.max(2) & !1) as usize;
+    let h = (height.max(2) & !1) as usize;
+    let y_len = w * h;
+    let half_w = w / 2;
+    let half_h = h / 2;
+    let uv_len = half_w * half_h;
+
+    let mut y_plane = vec![16u8; y_len];
+    let mut u_plane = vec![128u8; uv_len];
+    let mut v_plane = vec![128u8; uv_len];
+
+    let top_split_h = (h * 3) / 4;
+    let bar_width = w / 8;
+
+    let radar_speed = 8usize;
+    let radar_x = ((frame_index as usize) * radar_speed) % w;
+    let radar_width = 8usize;
+
+    let center_x = (w / 2) as i64;
+    let center_y = (top_split_h / 2) as i64;
+    let radar_radius = ((top_split_h / 4).min(w / 4)) as i64;
+    let angle_deg = ((frame_index * 6) % 360) as f64;
+    let angle_rad = angle_deg.to_radians();
+    let sin_a = angle_rad.sin();
+    let cos_a = angle_rad.cos();
+
+    for row in 0..h {
+        let is_top = row < top_split_h;
+        let c_row = row / 2;
+
+        for col in 0..w {
+            let c_col = col / 2;
+            let (mut y_val, mut u_val, mut v_val) = if is_top {
+                let bar_idx = (col / bar_width.max(1)).min(7);
+                let c = &SMPTE_BT709_COLORS[bar_idx];
+                (c.y, c.u, c.v)
+            } else {
+                let sub_bar = (col / (w / 4).max(1)).min(3);
+                match sub_bar {
+                    0 => (145, 147, 44),  // Cyan
+                    1 => (180, 128, 128), // 75% White
+                    2 => (63, 193, 204),  // Magenta
+                    _ => (16, 128, 128),   // Black
+                }
+            };
+
+            // Overlay 1: Moving vertical radar scanline
+            if col >= radar_x && col < radar_x + radar_width {
+                y_val = 240;
+                u_val = 128;
+                v_val = 128;
+            }
+
+            // Overlay 2: Rotating circular radar sweep in upper center
+            if is_top {
+                let dx = col as i64 - center_x;
+                let dy = row as i64 - center_y;
+                let dist_sq = dx * dx + dy * dy;
+                if dist_sq <= radar_radius * radar_radius {
+                    let dot = (dx as f64 * cos_a) + (dy as f64 * sin_a);
+                    let perp = (dx as f64 * -sin_a) + (dy as f64 * cos_a);
+                    if dot > 0.0 && perp.abs() < 2.5 {
+                        y_val = 255;
+                        u_val = 128;
+                        v_val = 128;
+                    }
+                }
+            }
+
+            y_plane[row * w + col] = y_val;
+            if row % 2 == 0 && col % 2 == 0 {
+                u_plane[c_row * half_w + c_col] = u_val;
+                v_plane[c_row * half_w + c_col] = v_val;
+            }
+        }
+    }
+
+    let timestamp_ntp = (frame_index * 1_000_000) / 60;
+
+    DecodedFrame {
+        y_plane,
+        u_plane,
+        v_plane,
+        width: w as u32,
+        height: h as u32,
+        y_stride: w as u32,
+        uv_stride: half_w as u32,
+        timestamp_ntp,
+        decode_duration_us: 100,
+    }
+}
+
+/// Global thread-safe state managing the live video frame stream and 60fps SMPTE generator.
+pub struct VideoStreamState {
+    latest_frame: Arc<RwLock<Option<Vec<u8>>>>,
+    running: Arc<AtomicBool>,
+}
+
+impl Default for VideoStreamState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VideoStreamState {
+    /// Create a new video stream state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            latest_frame: Arc::new(RwLock::new(None)),
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Returns `true` if the synthetic test pattern generator is currently running.
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Start the 60fps synthetic SMPTE generator task.
+    pub fn start_test_pattern(&self, width: u32, height: u32) {
+        if self.running.swap(true, Ordering::SeqCst) {
+            return;
+        }
+
+        let running_flag = Arc::clone(&self.running);
+        let frame_slot = Arc::clone(&self.latest_frame);
+
+        tokio::spawn(async move {
+            let mut frame_index = 0u64;
+            let mut ticker = tokio::time::interval(std::time::Duration::from_micros(16_667));
+            while running_flag.load(Ordering::Relaxed) {
+                ticker.tick().await;
+                let frame = generate_smpte_frame(width, height, frame_index);
+                let packed = frame.to_packed_bytes();
+                if let Ok(mut lock) = frame_slot.write() {
+                    *lock = Some(packed);
+                }
+                frame_index = frame_index.wrapping_add(1);
+            }
+        });
+    }
+
+    /// Stop the synthetic test pattern generator.
+    pub fn stop_test_pattern(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Retrieve the most recent packed video frame buffer, if available.
+    #[must_use]
+    pub fn get_latest_frame(&self) -> Option<Vec<u8>> {
+        self.latest_frame.read().ok()?.clone()
+    }
+
+    /// Push an externally decoded frame into the stream slot.
+    pub fn set_external_frame(&self, frame: &DecodedFrame) {
+        let packed = frame.to_packed_bytes();
+        if let Ok(mut lock) = self.latest_frame.write() {
+            *lock = Some(packed);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2439,4 +2729,69 @@ mod tests {
         assert_eq!(gatekeeper.telemetry().frames_decoded, 2);
         assert_eq!(gatekeeper.telemetry().frames_dropped_late, 1);
     }
+
+    // ── Step 8 unit tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_packed_frame_roundtrip() {
+        let original = generate_smpte_frame(640, 360, 42);
+        let packed = original.to_packed_bytes();
+        assert_eq!(&packed[0..4], &PACKED_FRAME_MAGIC);
+        assert_eq!(
+            packed.len(),
+            PACKED_FRAME_HEADER_LEN + (640 * 360) + (320 * 180 * 2)
+        );
+
+        let parsed = DecodedFrame::from_packed_bytes(&packed).expect("parse packed frame");
+        assert_eq!(parsed.width, 640);
+        assert_eq!(parsed.height, 360);
+        assert_eq!(parsed.y_stride, 640);
+        assert_eq!(parsed.uv_stride, 320);
+        assert_eq!(parsed.y_plane, original.y_plane);
+        assert_eq!(parsed.u_plane, original.u_plane);
+        assert_eq!(parsed.v_plane, original.v_plane);
+        assert!(parsed.is_valid_yuv420p());
+    }
+
+    #[test]
+    fn test_smpte_generator_plane_lengths_and_animation() {
+        // Landscape 1920x1080
+        let frame_1080 = generate_smpte_frame(1920, 1080, 0);
+        assert_eq!(frame_1080.width, 1920);
+        assert_eq!(frame_1080.height, 1080);
+        assert_eq!(frame_1080.y_plane.len(), 1920 * 1080);
+        assert_eq!(frame_1080.u_plane.len(), 960 * 540);
+        assert_eq!(frame_1080.v_plane.len(), 960 * 540);
+        assert!(frame_1080.is_valid_yuv420p());
+
+        // Portrait 1080x1920 (iPhone Screen Mirroring orientation)
+        let frame_portrait = generate_smpte_frame(1080, 1920, 0);
+        assert_eq!(frame_portrait.width, 1080);
+        assert_eq!(frame_portrait.height, 1920);
+        assert_eq!(frame_portrait.y_plane.len(), 1080 * 1920);
+        assert_eq!(frame_portrait.u_plane.len(), 540 * 960);
+        assert_eq!(frame_portrait.v_plane.len(), 540 * 960);
+        assert!(frame_portrait.is_valid_yuv420p());
+
+        // Verify animation changes across frame indices (radar movement)
+        let frame_a = generate_smpte_frame(640, 360, 0);
+        let frame_b = generate_smpte_frame(640, 360, 20);
+        assert_ne!(
+            frame_a.y_plane, frame_b.y_plane,
+            "Moving radar indicator must change luma plane across frames"
+        );
+    }
+
+    #[test]
+    fn test_video_stream_state_lifecycle() {
+        let state = VideoStreamState::new();
+        assert!(!state.is_running());
+        assert!(state.get_latest_frame().is_none());
+
+        let frame = generate_smpte_frame(320, 240, 1);
+        state.set_external_frame(&frame);
+        let latest = state.get_latest_frame().expect("external frame should be set");
+        assert_eq!(&latest[0..4], &PACKED_FRAME_MAGIC);
+    }
 }
+
