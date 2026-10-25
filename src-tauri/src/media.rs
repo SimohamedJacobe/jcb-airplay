@@ -1259,12 +1259,7 @@ pub struct DecodedFrame {
 impl DecodedFrame {
     /// Create a new DecodedFrame with pre-allocated planar YUV420p buffers.
     #[must_use]
-    pub fn new(
-        width: u32,
-        height: u32,
-        timestamp_ntp: u64,
-        decode_duration_us: u64,
-    ) -> Self {
+    pub fn new(width: u32, height: u32, timestamp_ntp: u64, decode_duration_us: u64) -> Self {
         let y_size = (width * height) as usize;
         let uv_size = ((width / 2) * (height / 2)) as usize;
         Self {
@@ -1325,10 +1320,8 @@ impl DecodedFrame {
     /// followed by raw planar `Y`, `U`, and `V` bytes.
     #[must_use]
     pub fn to_packed_bytes(&self) -> Vec<u8> {
-        let total_size = PACKED_FRAME_HEADER_LEN
-            + self.y_plane.len()
-            + self.u_plane.len()
-            + self.v_plane.len();
+        let total_size =
+            PACKED_FRAME_HEADER_LEN + self.y_plane.len() + self.u_plane.len() + self.v_plane.len();
         let mut buf = Vec::with_capacity(total_size);
         buf.extend_from_slice(&PACKED_FRAME_MAGIC);
         buf.extend_from_slice(&self.width.to_le_bytes());
@@ -1409,7 +1402,6 @@ pub const PACKED_FRAME_MAGIC: [u8; 4] = *b"JCBF";
 
 /// Exact byte length of the packed video frame header.
 pub const PACKED_FRAME_HEADER_LEN: usize = 28;
-
 
 /// Bit reader for parsing ITU-T H.264 RBSP bitstreams and Exp-Golomb coded integers.
 struct BitReader<'a> {
@@ -1889,9 +1881,10 @@ impl H264DecoderEngine for SoftwareH264DecoderEngine {
 
         // 2. Check if frame contains slice data (IDR or non-IDR)
         let has_slice = frame.is_keyframe
-            || frame.nal_units.iter().any(|n| {
-                matches!(n.nal_type, NalUnitType::IdrSlice | NalUnitType::NonIdrSlice)
-            });
+            || frame
+                .nal_units
+                .iter()
+                .any(|n| matches!(n.nal_type, NalUnitType::IdrSlice | NalUnitType::NonIdrSlice));
 
         if !has_slice {
             return Ok(None);
@@ -2037,8 +2030,8 @@ impl<D: H264DecoderEngine> JitterGatekeeper<D> {
         queue_depth: usize,
         latency_us: u64,
     ) -> Result<Option<DecodedFrame>, MediaError> {
-        let is_idr_keyframe = frame.is_keyframe
-            || frame.nal_units.iter().any(|n| n.nal_type.is_keyframe());
+        let is_idr_keyframe =
+            frame.is_keyframe || frame.nal_units.iter().any(|n| n.nal_type.is_keyframe());
 
         let congested = queue_depth > self.max_queue_depth || latency_us > self.latency_ceiling_us;
 
@@ -2057,7 +2050,9 @@ impl<D: H264DecoderEngine> JitterGatekeeper<D> {
         let result = self.decoder.decode_frame(frame, timestamp_ntp)?;
         if let Some(ref decoded) = result {
             self.telemetry.frames_decoded += 1;
-            self.total_decode_us = self.total_decode_us.saturating_add(decoded.decode_duration_us);
+            self.total_decode_us = self
+                .total_decode_us
+                .saturating_add(decoded.decode_duration_us);
             self.telemetry.avg_decode_us =
                 self.total_decode_us as f64 / self.telemetry.frames_decoded as f64;
         }
@@ -2080,7 +2075,9 @@ impl<D: H264DecoderEngine> JitterGatekeeper<D> {
                 assembler.process_codec_config(&packet.payload)?;
                 if !assembler.cached_sps().is_empty() {
                     let sps_frame = AnnexBFrame::from_annexb(assembler.cached_sps().to_vec());
-                    let _ = self.decoder.decode_frame(&sps_frame, packet.header.timestamp_ntp);
+                    let _ = self
+                        .decoder
+                        .decode_frame(&sps_frame, packet.header.timestamp_ntp);
                 }
                 Ok(None)
             }
@@ -2157,14 +2154,46 @@ pub struct SmpteColor {
 
 /// The eight canonical 75% ITU-R BT.709 SMPTE color bars.
 pub const SMPTE_BT709_COLORS: [SmpteColor; 8] = [
-    SmpteColor { y: 180, u: 128, v: 128 }, // 75% White
-    SmpteColor { y: 168, u: 44,  v: 136 }, // Yellow
-    SmpteColor { y: 145, u: 147, v: 44  }, // Cyan
-    SmpteColor { y: 133, u: 63,  v: 52  }, // Green
-    SmpteColor { y: 63,  u: 193, v: 204 }, // Magenta
-    SmpteColor { y: 51,  u: 109, v: 212 }, // Red
-    SmpteColor { y: 28,  u: 212, v: 120 }, // Blue
-    SmpteColor { y: 16,  u: 128, v: 128 }, // Black
+    SmpteColor {
+        y: 180,
+        u: 128,
+        v: 128,
+    }, // 75% White
+    SmpteColor {
+        y: 168,
+        u: 44,
+        v: 136,
+    }, // Yellow
+    SmpteColor {
+        y: 145,
+        u: 147,
+        v: 44,
+    }, // Cyan
+    SmpteColor {
+        y: 133,
+        u: 63,
+        v: 52,
+    }, // Green
+    SmpteColor {
+        y: 63,
+        u: 193,
+        v: 204,
+    }, // Magenta
+    SmpteColor {
+        y: 51,
+        u: 109,
+        v: 212,
+    }, // Red
+    SmpteColor {
+        y: 28,
+        u: 212,
+        v: 120,
+    }, // Blue
+    SmpteColor {
+        y: 16,
+        u: 128,
+        v: 128,
+    }, // Black
 ];
 
 /// Generate a synthetic 60fps SMPTE YUV420p test frame with moving radar indicator.
@@ -2218,7 +2247,7 @@ pub fn generate_smpte_frame(width: u32, height: u32, frame_index: u64) -> Decode
                     0 => (145, 147, 44),  // Cyan
                     1 => (180, 128, 128), // 75% White
                     2 => (63, 193, 204),  // Magenta
-                    _ => (16, 128, 128),   // Black
+                    _ => (16, 128, 128),  // Black
                 }
             };
 
@@ -2382,11 +2411,26 @@ mod tests {
 
     #[test]
     fn stream_payload_type_mapping() {
-        assert_eq!(StreamPayloadType::from_u16(0x00), StreamPayloadType::VideoBitstream);
-        assert_eq!(StreamPayloadType::from_u16(0x01), StreamPayloadType::CodecConfig);
-        assert_eq!(StreamPayloadType::from_u16(0x02), StreamPayloadType::Heartbeat);
-        assert_eq!(StreamPayloadType::from_u16(0x05), StreamPayloadType::StreamingReport);
-        assert_eq!(StreamPayloadType::from_u16(0x99), StreamPayloadType::Unknown(0x99));
+        assert_eq!(
+            StreamPayloadType::from_u16(0x00),
+            StreamPayloadType::VideoBitstream
+        );
+        assert_eq!(
+            StreamPayloadType::from_u16(0x01),
+            StreamPayloadType::CodecConfig
+        );
+        assert_eq!(
+            StreamPayloadType::from_u16(0x02),
+            StreamPayloadType::Heartbeat
+        );
+        assert_eq!(
+            StreamPayloadType::from_u16(0x05),
+            StreamPayloadType::StreamingReport
+        );
+        assert_eq!(
+            StreamPayloadType::from_u16(0x99),
+            StreamPayloadType::Unknown(0x99)
+        );
 
         assert_eq!(StreamPayloadType::VideoBitstream.as_u16(), 0x00);
         assert_eq!(StreamPayloadType::CodecConfig.as_u16(), 0x01);
@@ -2508,7 +2552,8 @@ mod tests {
         record.extend_from_slice(pps_data);
 
         let mut asm = H264AnnexBAssembler::new();
-        asm.process_codec_config(&record).expect("codec config parse");
+        asm.process_codec_config(&record)
+            .expect("codec config parse");
         assert!(asm.has_codec_config());
 
         let expected_sps: Vec<u8> = [&ANNEXB_START_CODE[..], sps_data].concat();
@@ -2610,8 +2655,7 @@ mod tests {
         reassembled.extend(chunk3);
 
         assert_eq!(
-            reassembled,
-            reference_ciphertext,
+            reassembled, reference_ciphertext,
             "CTR keystream continuity broken across chunk boundaries"
         );
         assert_eq!(proc.bytes_processed(), 128);
@@ -2705,25 +2749,19 @@ mod tests {
         let non_ref_frame = AnnexBFrame::from_annexb(non_ref_data);
 
         // Under normal queue depth (1 <= 2): non-ref frame is admitted and decoded
-        let res = gatekeeper
-            .process_frame(&non_ref_frame, 1000, 1)
-            .unwrap();
+        let res = gatekeeper.process_frame(&non_ref_frame, 1000, 1).unwrap();
         assert!(res.is_some());
         assert_eq!(gatekeeper.telemetry().frames_decoded, 1);
         assert_eq!(gatekeeper.telemetry().frames_dropped_late, 0);
 
         // Under congestion (queue_depth = 5 > 2): non-ref frame is shed
-        let res_dropped = gatekeeper
-            .process_frame(&non_ref_frame, 2000, 5)
-            .unwrap();
+        let res_dropped = gatekeeper.process_frame(&non_ref_frame, 2000, 5).unwrap();
         assert!(res_dropped.is_none());
         assert_eq!(gatekeeper.telemetry().frames_dropped_late, 1);
         assert_eq!(gatekeeper.telemetry().frames_decoded, 1);
 
         // Under congestion (queue_depth = 5 > 2): IDR keyframe MUST NOT be shed!
-        let res_keyframe = gatekeeper
-            .process_frame(&keyframe, 3000, 5)
-            .unwrap();
+        let res_keyframe = gatekeeper.process_frame(&keyframe, 3000, 5).unwrap();
         assert!(res_keyframe.is_some());
         assert_eq!(gatekeeper.telemetry().keyframes_processed, 1);
         assert_eq!(gatekeeper.telemetry().frames_decoded, 2);
@@ -2790,8 +2828,9 @@ mod tests {
 
         let frame = generate_smpte_frame(320, 240, 1);
         state.set_external_frame(&frame);
-        let latest = state.get_latest_frame().expect("external frame should be set");
+        let latest = state
+            .get_latest_frame()
+            .expect("external frame should be set");
         assert_eq!(&latest[0..4], &PACKED_FRAME_MAGIC);
     }
 }
-

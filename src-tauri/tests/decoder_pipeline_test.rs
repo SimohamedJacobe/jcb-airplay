@@ -124,10 +124,7 @@ fn test_decoder_pipeline_120_packet_burst_with_congestion() {
                 decoded.height, 1080,
                 "Decoded frame height must match SPS height"
             );
-            assert_eq!(
-                decoded.y_stride, 1920,
-                "Y stride must equal frame width"
-            );
+            assert_eq!(decoded.y_stride, 1920, "Y stride must equal frame width");
             assert_eq!(
                 decoded.uv_stride, 960,
                 "UV stride must equal frame width / 2"

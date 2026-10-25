@@ -228,11 +228,17 @@ fn test_avcc_multi_nal_sei_plus_idr_frame() {
 
 #[test]
 fn test_aes_ctr_keystream_continuity_multi_packet() {
-    let key = StreamKey::from_bytes(&[0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE,
-                                      0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF],
-                                    &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
-                                      0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00])
-        .expect("valid StreamKey");
+    let key = StreamKey::from_bytes(
+        &[
+            0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+            0xCD, 0xEF,
+        ],
+        &[
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ],
+    )
+    .expect("valid StreamKey");
 
     // Known plaintext: a 256-byte sequence
     let plaintext: Vec<u8> = (0..=255u8).collect();
@@ -243,7 +249,10 @@ fn test_aes_ctr_keystream_continuity_multi_packet() {
     ref_proc.apply(&mut reference_ciphertext);
 
     // Verify encryption is not identity (cipher actually transforms data)
-    assert_ne!(reference_ciphertext, plaintext, "CTR must transform plaintext");
+    assert_ne!(
+        reference_ciphertext, plaintext,
+        "CTR must transform plaintext"
+    );
 
     // Now use a fresh CtrStreamProcessor with same key/IV, applied in 4 uneven chunks
     // This simulates 4 successive video bitstream TCP packets arriving from the iPhone.
@@ -289,8 +298,10 @@ fn test_aes_ctr_keystream_continuity_multi_packet() {
 fn test_end_to_end_encrypted_avcc_idr_to_annexb() {
     let stream_key = StreamKey::from_bytes(
         &[0x42u8; 16],
-        &[0x13, 0x37, 0x00, 0xFF, 0xDE, 0xAD, 0xBE, 0xEF,
-          0x42, 0x42, 0x42, 0x42, 0xCA, 0xFE, 0xBA, 0xBE],
+        &[
+            0x13, 0x37, 0x00, 0xFF, 0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x42, 0x42, 0x42, 0xCA, 0xFE,
+            0xBA, 0xBE,
+        ],
     )
     .expect("valid StreamKey");
 
@@ -328,7 +339,8 @@ fn test_end_to_end_encrypted_avcc_idr_to_annexb() {
     // Verify decrypted NAL data matches original plaintext
     let recovered_nal1 = &frame1.data[nal1.offset + 4..nal1.offset + 4 + nal1.length];
     assert_eq!(
-        recovered_nal1, non_idr_plaintext.as_slice(),
+        recovered_nal1,
+        non_idr_plaintext.as_slice(),
         "non-IDR NAL: decrypted payload mismatch"
     );
 
@@ -349,7 +361,8 @@ fn test_end_to_end_encrypted_avcc_idr_to_annexb() {
     // Verify decrypted IDR NAL data matches original plaintext
     let recovered_nal2 = &frame2.data[nal2.offset + 4..nal2.offset + 4 + nal2.length];
     assert_eq!(
-        recovered_nal2, idr_plaintext.as_slice(),
+        recovered_nal2,
+        idr_plaintext.as_slice(),
         "IDR NAL: decrypted payload mismatch (CTR continuity broken?)"
     );
 
@@ -446,8 +459,14 @@ fn test_truncated_avcc_packet_no_panic() {
     let mut payload: Vec<u8> = 1000u32.to_be_bytes().to_vec();
     payload.extend(&[0x65u8; 10]);
     let frame = asm.process_video_bitstream(&mut payload).unwrap();
-    assert!(frame.nal_units.is_empty(), "truncated NAL must produce empty NAL list");
-    assert!(frame.data.is_empty(), "truncated NAL frame data must be empty");
+    assert!(
+        frame.nal_units.is_empty(),
+        "truncated NAL must produce empty NAL list"
+    );
+    assert!(
+        frame.data.is_empty(),
+        "truncated NAL frame data must be empty"
+    );
     assert!(!frame.is_keyframe);
 
     // Zero-length NAL prefix (degenerate case)

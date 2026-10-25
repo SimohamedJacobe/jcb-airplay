@@ -109,7 +109,10 @@ fn test_packed_frame_binary_payload_header_and_planes() {
     let packed = frame.to_packed_bytes();
 
     // Verify 28-byte binary header
-    assert_eq!(packed.len(), PACKED_FRAME_HEADER_LEN + (640 * 360) + (320 * 180 * 2));
+    assert_eq!(
+        packed.len(),
+        PACKED_FRAME_HEADER_LEN + (640 * 360) + (320 * 180 * 2)
+    );
     assert_eq!(&packed[0..4], &PACKED_FRAME_MAGIC);
 
     let parsed_width = u32::from_le_bytes(packed[4..8].try_into().unwrap());
@@ -148,7 +151,10 @@ async fn test_video_stream_state_start_stop_and_frame_pull() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     let frame_opt = state.get_latest_frame();
-    assert!(frame_opt.is_some(), "Stream state must contain generated frame");
+    assert!(
+        frame_opt.is_some(),
+        "Stream state must contain generated frame"
+    );
     let frame_bytes = frame_opt.unwrap();
     assert_eq!(&frame_bytes[0..4], &PACKED_FRAME_MAGIC);
 

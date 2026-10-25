@@ -254,9 +254,7 @@ fn test_spsc_throughput_10000_packets_1080p60_submillisecond_latency() {
 
     done.store(true, Ordering::Release);
 
-    let (received_count, final_telem) = consumer_handle
-        .join()
-        .expect("consumer thread panicked");
+    let (received_count, final_telem) = consumer_handle.join().expect("consumer thread panicked");
     let total_duration = start_time.elapsed();
 
     // Calculate latency metrics
@@ -264,15 +262,16 @@ fn test_spsc_throughput_10000_packets_1080p60_submillisecond_latency() {
     let avg_latency_micros = (total_nanos as f64) / (PACKET_COUNT as f64 * 1000.0);
     let avg_latency_millis = avg_latency_micros / 1000.0;
 
-    println!(
-        "\n--- JCB AirPlay SPSC Ring Buffer Benchmark ---"
-    );
+    println!("\n--- JCB AirPlay SPSC Ring Buffer Benchmark ---");
     println!("Pushed: {} packets", final_telem.packets_pushed);
     println!("Popped: {} packets", final_telem.packets_popped);
     println!("Dropped: {} packets", final_telem.packets_dropped_overflow);
     println!("High Water Mark: {} slots", final_telem.high_water_mark);
     println!("Total Elapsed Time: {:?}", total_duration);
-    println!("Average Transfer Latency: {:.4} ms ({:.2} µs)", avg_latency_millis, avg_latency_micros);
+    println!(
+        "Average Transfer Latency: {:.4} ms ({:.2} µs)",
+        avg_latency_millis, avg_latency_micros
+    );
     println!("-----------------------------------------------\n");
 
     // Assert zero dropped packets under normal drain
