@@ -2298,6 +2298,7 @@ pub fn generate_smpte_frame(width: u32, height: u32, frame_index: u64) -> Decode
 }
 
 /// Global thread-safe state managing the live video frame stream and 60fps SMPTE generator.
+#[derive(Clone)]
 pub struct VideoStreamState {
     latest_frame: Arc<RwLock<Option<Vec<u8>>>>,
     running: Arc<AtomicBool>,
